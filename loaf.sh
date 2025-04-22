@@ -1,7 +1,6 @@
 #!/bin/bash
 
 # loaf.sh - Reference implementation of LoaF (Linear Object Archive Format) 🍞
-# Version: 1.7 (Interactive Stdin Support)
 #
 # Created with loaf by Jeremy Carter, Tim and Tuesday (ChatGPT GPT-4o-based
 # Custom GPTs), and Gemini Code Assist (Google Gemini 2.0 Flash in VSCode
