@@ -1,0 +1,6 @@
+*.bak
+*.bak.*
+*.tar.gz
+*.loaf
+*.loaf.*
+!.loaf.sh
