@@ -27,7 +27,11 @@ set -e # Exit immediately if a command exits with a non-zero status.
 set -u # Treat unset variables as an error when substituting. Alias for -o nounset
 set -o pipefail # Return value of a pipeline is the status of the last command to exit with non-zero status, or zero if no command exited with non-zero status.
 set -o noclobber # Prevent output redirection (>) from overwriting existing files.
-# set -o posix # Keep commented out for now, seems okay without it
+set -o posix # Keep commented out for now, seems okay without it
+set -o errtrace # Exit immediately if a command exits with a non-zero status, even if it's in a subshell or function.
+set -o functrace # Trace function calls, including subshells and functions.
+set -h # Hash all commands for faster execution.
+#set -o xtrace # Print commands and their arguments as they are executed.
 
 # --- Global Variables ---
 VERBOSE=false

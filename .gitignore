@@ -3,5 +3,6 @@
 *.tar.gz
 *.loaf
 *.loaf.*
+sample.txt
 !.loaf.sh
-!sample.loaf
+!sample.txt.loaf
