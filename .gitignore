@@ -4,3 +4,4 @@
 *.loaf
 *.loaf.*
 !.loaf.sh
+!sample.loaf
