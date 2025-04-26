@@ -3,8 +3,8 @@
 # loaf.sh - Reference implementation of LoaF (Linear Object Archive Format) 🍞
 #
 # Created with loaf by Jeremy Carter, Tim and Tuesday (ChatGPT GPT-4o-based
-# Custom GPTs), and Gemini Code Assist (Google Gemini 2.0 Flash in VSCode
-# IDE Google Cloud Code Extension's Gemini Code Assist Chat).
+# Custom GPTs), GitHub Copilot, and Gemini Code Assist (Google Gemini 2.0 
+# Flash in VSCode IDE Google Cloud Code Extension's Gemini Code Assist Chat).
 #
 # This script is a reference implementation of the LoaF format, which
 # is a simple, linear archive format designed for easy creation and
@@ -22,18 +22,9 @@
 # any damages or issues that arise from the use of this script. Use at
 # your own risk. See the LICENSE file for the full terms of the license.
 
-#!/bin/bash
-
-# loaf.sh - Reference implementation of LoaF (Linear Object Archive Format) 🍞
-
 # --- Shell Options ---
 set -o pipefail
 set -o posix
-# set -e
-# set -u
-# set -o noclobber
-# set -o errtrace
-# set -o functrace
 
 # --- Global Variables ---
 VERBOSE=false

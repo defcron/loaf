@@ -1,79 +1,128 @@
 # LoaF — Linear Object Archive Format 🍞
 
-LoaF (`.loaf`) is a minimalist, self-validating, stream-friendly archive format. It wraps a compressed tar archive in a newline-free hex encoding, topped with a SHA256 hash for verification. LoaF is designed to be simple, lightweight, and easy to use in shell pipelines.
+LoaF (`.loaf`) is a delightfully simple, single-line, self-validating archive format perfect for the command line. Think of it as taking your files or directories, rolling them up in a standard `tar.gz` bundle, hex-encoding the whole thing so it travels nicely through text-only systems, and sticking a checksum label on top so you know it hasn't been nibbled on arrival.
 
-LoaF is ideal for:
+It's designed to be stream-friendly, easily verifiable, and play nicely with all your favorite shell tools.
 
-- 🧵 Sending archives over pipes
-- 🧾 Copying binary payloads over email, chat, or plaintext logs
-- 🛠 Simple, shell-compatible workflows
-- 🔐 Tamper-evident artifact delivery
-- 📦 Packaging and distributing files
-- 🧩 Easy integration with existing tools
-- 🧩 Composable with other UNIX tools
-- 🧩 Compatible with `tar`, `gzip`, `xxd`, and `sha256sum`
-- 🔄 Stream-friendly for easy integration with other tools
-- 🔄 Supports compression and checksum verification
-- 🔄 Human-readable format for easy inspection
-- 🔄 Lightweight and efficient for quick operations
-- 🔄 Easy to use with shell pipelines
-- 🔄 Compatible with existing UNIX tools for easy integration
-- 🔄 Flexible for various use cases, from packaging to distribution
-- 🔄 Designed for simplicity and ease of use
-- 🔄 Supports both file and directory archiving
-- 🔄 Provides a clear and concise format for archiving
-- 🔄 Allows for easy inspection and verification of archives
-- 🔄 Ensures compatibility with various UNIX tools
-- 🔄 Provides a simple command-line interface for easy use
+LoaF is baked fresh for:
+
+- **Stream Team:** Sending archives smoothly through shell pipelines (`|`).
+- **Plaintext Pal:** Copying binary data safely via email, chat, logs, or anywhere newlines fear to tread.
+- **Shell Shenanigans:** Enabling simple, powerful, composable workflows using standard UNIX tools (`tar`, `gzip`, `xxd`, `sha256sum`).
+- **Trusty Transfers:** Delivering artifacts where you can easily verify they haven't been tampered with (thanks, SHA256!).
+- **Simple Storage:** Packaging files or directories into a single, verifiable blob.
+- **Easy Integration:** Plays well with scripts and existing command-line utilities.
+- **Quick Checks:** Human-readable enough (well, the header is!) for basic inspection.
 
 ## 🛠 Usage Examples
 
-### Create a LoaF Archive
+Let's get baking! (`loaf.sh` is assumed to be executable in the current path, e.g., `./loaf.sh`)
+
+### Creating a LoaF (`make`, `c`)
 
 ```bash
-# Create a LoaF archive from an input directory or file, and save it to a new .loaf file:
-./loaf.sh c path/to/input/file/or/directory path/to/output/file.loaf
+# Archive a file/directory into a .loaf file
+./loaf.sh c path/to/input my_archive.loaf
 
-# Create a LoaF archive from an input directory or file, and output the .loaf to stdout:
-./loaf.sh c path/to/input/file/or/directory
+# Archive a file/directory and print the .loaf content to stdout
+./loaf.sh c path/to/input
 
-# Create a LoaF archive from arbitrary stdin contents, and output the .loaf to stdout. By default, the file inside the archive will be named `-`:
-cat path/to/input/file | ./loaf.sh c
+# Pipe data into a .loaf file (archive contains 'some_data' contents in a file named '-' by default)
+cat some_data | ./loaf.sh c - my_data.loaf
 
-# Create a LoaF archive from arbitrary stdin contents, and save it to a new .loaf file. By default, the file inside the archive will be named `-`:
-cat path/to/input/file | ./loaf.sh c - path/to/output/file.loaf
+# Pipe data and print the .loaf content to stdout (archive contains 'some_data' contents in a file named '-' by default)
+cat some_data | ./loaf.sh c
 
-# Create a LoaF archive from arbitrary stdin contents, providing a custom filename for the file inside the archive (`custom_filename.txt` in this example), and save it to a new .loaf file:
-cat path/to/input/file | ./loaf.sh c -custom_filename.txt path/to/output/file.loaf
+# Pipe data, name the file inside the archive `image.png`, save the .loaf archive to a file named image.png.loaf
+cat image.png | ./loaf.sh c -image.png image.png.loaf
 
-# Create a LoaF archive from arbitrary stdin contents, providing a custom filename for the file inside the archive, and output the .loaf to stdout:
-cat path/to/input/file | ./loaf.sh c -custom_filename.txt
+# Pipe data, give the archived file a name, print the .loaf to stdout
+cat image.png | ./loaf.sh c -image.png
 
-# Verbose output of the LoaF archive creation process:
-./loaf.sh -v c path/to/input/file/or/directory path/to/output/file.loaf
+# Create a .loaf interactively and save it to file named 'interactive.loaf' (type the contents you want to archive in the .loaf file, then press Enter, then press Ctrl+D to finish and save)
+./loaf.sh make - interactive.loaf
+
+# Use -v for verbose output during any operation
+./loaf.sh -v c path/to/input my_archive.loaf
 ```
 
-## 📄 Format
+## Verifying a LoaF (`verify`)
 
-Each `.loaf` file is structured as:
-
+```bash
+# Check if the loaf is fresh and untampered
+./loaf.sh verify my_archive.loaf
+# (Outputs status to stderr and exits 0 if OK, 1 if mismatch/error)
 ```
-SHA256(-)=<64-character hash> <hex-encoded gzip’d tarball>
+
+### Extracting a LoaF (`extract`, `x`)
+
+```bash
+# Extract contents into the current directory (.)
+./loaf.sh x my_archive.loaf
+
+# Extract contents into a specific directory (which will be created if it doesn't exist)
+./loaf.sh x my_archive.loaf ./output_directory
+
+# Extract to stdout - RAW concatenated content of all files
+# (Useful for single-file archives or specific streaming tasks)
+./loaf.sh x my_archive.loaf -
+
+# Extract to stdout - DELIMITED content (Default: '␜' symbol)
+# Inserts the delimiter *between* the content of each extracted file.
+./loaf.sh x my_archive.loaf --
+
+# Extract to stdout - DELIMITED content with a custom delimiter (e.g., newline)
+# Use --$'...' for special characters like null bytes (\0) or newlines (\n), or
+# simply do similar as --"$DELIMETER" for any other string delimiter.
+./loaf.sh x my_archive.loaf --$'\n'
+# or
+./loaf.sh x my_archive.loaf --"$DELIMITER"
+
+# Extract using a command's output as a (potentially chaotic!) delimiter
+# (The command runs *first*, its output becomes the delimiter string)
+./loaf.sh x my_archive.loaf --"$(date)"
 ```
 
-- Guaranteed **one-line** (newline-free) if valid
-- `exit 0` from `loaf.sh make` when loaf is clean
-- Fully compatible with standard UNIX tools (`tar`, `gzip`, `xxd`, `sha256sum`)
+## 📄 Format Explained
+
+A valid LoaF file is always one single line structured like this:
+
+```plaintext
+SHA256(-)=<64-hex-hash> <hex-encoded-gzipped-tar-data>
+```
+
+1. SHA256(-)=<hash>: The verification header. The hash is calculated from the <hex-encoded-gzipped-tar-data> part only.
+2. (Space): A single space separates the header from the data.
+3. <hex-encoded-gzipped-tar-data>: The actual archive content. This is created by:
+   - Taking the input file/directory.
+   - Archiving it using tar.
+   - Compressing the tarball using gzip.
+   - Hex-encoding the compressed bytes using xxd -p -c0.
+
+Extraction reverses this process: hex-decode -> gunzip -> untar.
 
 ## 💡 Philosophy
 
-LoaF is designed to be:
+LoaF aims to be:
 
-- Deterministic and verifiable
-- Composable in shell pipelines
-- Lightweight
-- Human-readable and fun to use
+- Simple: Easy to understand, implement, and use with standard tools.
+- Verifiable: Built-in checksum ensures data integrity.
+- Composable: Designed for easy use in shell pipelines.
+- Streamable: The single-line format is ideal for text-based streams.
+- Robust: Avoids issues with newlines or binary data in text channels.
+- (A Little) Fun: Because why not? 🍞
+
+## 🛠️ Dependencies
+
+Nothing fancy! Just standard UNIX tools:
+
+- `tar`
+- `gzip`
+- `xxd`
+- `sha256sum`
+- `awk`
+- ... etc.
 
 ## 📜 License
 
-MIT — see [LICENSE](./LICENSE) for the full terms of the license.
+MIT — see LICENSE for the full terms.
