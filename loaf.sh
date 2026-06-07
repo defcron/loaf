@@ -24,7 +24,7 @@
 
 # --- Shell Options ---
 set -o pipefail
-set -o posix
+#set -o posix
 
 # --- Global Variables ---
 VERBOSE=false
