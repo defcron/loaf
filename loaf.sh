@@ -24,7 +24,7 @@
 
 # --- Shell Options ---
 set -o pipefail
-set -o posix
+#set -o posix  # commented out because this causes problems on macOS
 
 # --- Global Variables ---
 VERBOSE=false
