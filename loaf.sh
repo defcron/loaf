@@ -24,42 +24,283 @@
 
 # --- Shell Options ---
 set -o pipefail
-#set -o posix  # commented out because this causes problems on macOS
+#set -o posix
 
 # --- Global Variables ---
 VERBOSE=false
-TMPFILE_PATH=""
+TMPDIR_BASE="${TMPDIR:-/tmp}"
+TMPDIR_PATH=$(mktemp -d "${TMPDIR_BASE%/}/loaf.XXXXXX") || {
+  echo "[!] Error: Failed to create temporary directory." >&2
+  exit 1
+}
+LOAF_HEADER_PREFIX="SHA256(-)="
+LOAF_HASH_LEN=64
+LOAF_HEADER_LEN=$((${#LOAF_HEADER_PREFIX} + LOAF_HASH_LEN + 1))
+LOAF_PAYLOAD_OFFSET=$((LOAF_HEADER_LEN + 1))
 
 # --- Cleanup Function ---
 cleanup() {
-  if [[ -n "$TMPFILE_PATH" && -f "$TMPFILE_PATH" ]]; then
-    rm -f "$TMPFILE_PATH"
+  if [[ -n "$TMPDIR_PATH" && -d "$TMPDIR_PATH" ]]; then
+    rm -rf "$TMPDIR_PATH"
   fi
 }
 trap cleanup EXIT INT TERM HUP
 
 # --- Functions ---
 
+loaf_temp_path() {
+  local prefix="$1"
+  local path
+  path=$(mktemp "$TMPDIR_PATH/${prefix}.XXXXXX") || {
+    echo "[!] Error: Failed to create temporary file." >&2
+    return 1
+  }
+  printf "%s" "$path"
+}
+
+loaf_temp_dir() {
+  local prefix="$1"
+  local path
+  path=$(mktemp -d "$TMPDIR_PATH/${prefix}.XXXXXX") || {
+    echo "[!] Error: Failed to create temporary directory." >&2
+    return 1
+  }
+  printf "%s" "$path"
+}
+
+loaf_sha256_file() {
+  local input="$1"
+  local hash=""
+
+  if command -v sha256sum >/dev/null 2>&1; then
+    hash=$(sha256sum "$input" 2>/dev/null | awk '{print $1}')
+  elif command -v shasum >/dev/null 2>&1; then
+    hash=$(shasum -a 256 "$input" 2>/dev/null | awk '{print $1}')
+  elif command -v openssl >/dev/null 2>&1; then
+    hash=$(openssl dgst -sha256 -r "$input" 2>/dev/null | awk '{print $1}')
+  else
+    echo "[!] Error: No SHA256 tool found (need sha256sum, shasum, or openssl)." >&2
+    return 1
+  fi
+
+  if [[ ! "$hash" =~ ^[0-9A-Fa-f]{64}$ ]]; then
+    echo "[!] Error: Failed to calculate SHA256 checksum." >&2
+    return 1
+  fi
+
+  printf "%s" "$hash" | tr 'A-F' 'a-f'
+}
+
+loaf_sha256_stream() {
+  local hash=""
+
+  if command -v sha256sum >/dev/null 2>&1; then
+    hash=$(sha256sum 2>/dev/null | awk '{print $1}')
+  elif command -v shasum >/dev/null 2>&1; then
+    hash=$(shasum -a 256 2>/dev/null | awk '{print $1}')
+  elif command -v openssl >/dev/null 2>&1; then
+    hash=$(openssl dgst -sha256 -r 2>/dev/null | awk '{print $1}')
+  else
+    echo "[!] Error: No SHA256 tool found (need sha256sum, shasum, or openssl)." >&2
+    return 1
+  fi
+
+  if [[ ! "$hash" =~ ^[0-9A-Fa-f]{64}$ ]]; then
+    echo "[!] Error: Failed to calculate SHA256 checksum." >&2
+    return 1
+  fi
+
+  printf "%s" "$hash" | tr 'A-F' 'a-f'
+}
+
+loaf_file_size() {
+  local input="$1"
+  stat -f%z "$input" 2>/dev/null || stat -c%s "$input" 2>/dev/null
+}
+
+loaf_last_byte_hex() {
+  local input="$1"
+  local size=""
+
+  size=$(loaf_file_size "$input") || return 1
+  if [[ "$size" -eq 0 ]]; then
+    return 1
+  fi
+
+  tail -c 1 -- "$input" | od -An -tx1 | awk '{print $1}'
+}
+
+loaf_file_ends_with_newline() {
+  local input="$1"
+  local last_byte=""
+
+  last_byte=$(loaf_last_byte_hex "$input") || return 1
+  [[ "$last_byte" == "0a" ]]
+}
+
+loaf_chomp_final_newline() {
+  local input="$1"
+  local size=""
+  local last_byte=""
+  local new_size=""
+
+  size=$(loaf_file_size "$input") || return 1
+  if [[ "$size" -eq 0 ]]; then
+    return 0
+  fi
+
+  last_byte=$(loaf_last_byte_hex "$input") || return 1
+  if [[ "$last_byte" != "0a" ]]; then
+    return 0
+  fi
+
+  new_size=$((size - 1))
+
+  if command -v truncate >/dev/null 2>&1; then
+    truncate -s "$new_size" "$input"
+  elif command -v perl >/dev/null 2>&1; then
+    perl -e 'truncate $ARGV[0], $ARGV[1] or die "truncate failed\n"' "$input" "$new_size"
+  else
+    echo "[!] Error: Cannot remove trailing newline without truncate or perl." >&2
+    return 1
+  fi
+}
+
+loaf_read_header_hash() {
+  local input="$1"
+  local header=""
+  local hash=""
+
+  header=$(dd if="$input" bs="$LOAF_HEADER_LEN" count=1 2>/dev/null)
+  if [[ ${#header} -lt "$LOAF_HEADER_LEN" ]]; then
+    echo "[!] Error: Failed to read a complete LoaF header from '$input'." >&2
+    return 1
+  fi
+
+  if [[ "${header:0:${#LOAF_HEADER_PREFIX}}" != "$LOAF_HEADER_PREFIX" ]]; then
+    echo "[!] Error: Invalid or missing SHA256 header format at start of '$input'." >&2
+    echo "[i] Expected format like: SHA256(-)=<64_hex_chars>" >&2
+    return 1
+  fi
+
+  hash="${header:${#LOAF_HEADER_PREFIX}:$LOAF_HASH_LEN}"
+  if [[ ! "$hash" =~ ^[0-9A-Fa-f]{64}$ ]]; then
+    echo "[!] Error: Invalid SHA256 hash in header for '$input'." >&2
+    return 1
+  fi
+
+  if [[ "${header:$((LOAF_HEADER_LEN - 1)):1}" != " " ]]; then
+    echo "[!] Error: Invalid format. Expected a space immediately after the header string in '$input'." >&2
+    return 1
+  fi
+
+  printf "%s" "$hash" | tr 'A-F' 'a-f'
+}
+
+loaf_payload_stream() {
+  local input="$1"
+  tail -c +"$LOAF_PAYLOAD_OFFSET" -- "$input"
+}
+
+loaf_validate_archive_name() {
+  local archive_name="$1"
+
+  if [[ -z "$archive_name" || "$archive_name" == /* || "$archive_name" == "." || "$archive_name" == ".." || "$archive_name" == ../* || "$archive_name" == */../* || "$archive_name" == */.. || "$archive_name" == */ ]]; then
+    echo "[!] Error: Invalid archive name '$archive_name'." >&2
+    echo "[i] Archive names from stdin must be relative file paths without '..' path components." >&2
+    exit 1
+  fi
+}
+
+loaf_archive_to_hex_file() {
+  local hex_file="$1"
+  local tar_opts="-cpf"
+  shift
+
+  if [[ "$VERBOSE" == true ]]; then
+    tar_opts="-cvpf"
+    echo "[i] Archiving input..." >&2
+    if ! tar --numeric-owner "$tar_opts" - "$@" | gzip -9 | xxd -p -c0 > "$hex_file"; then
+      echo "[!] Error: Failed to create archive payload." >&2
+      return 1
+    fi
+  else
+    if ! { tar --numeric-owner "$tar_opts" - "$@" | gzip -9 | xxd -p -c0 > "$hex_file"; } 2>/dev/null; then
+      echo "[!] Error: Failed to create archive payload." >&2
+      return 1
+    fi
+  fi
+
+  loaf_chomp_final_newline "$hex_file" || return 1
+}
+
+loaf_write_output() {
+  local hex_file="$1"
+  local output="$2"
+  local crumb_hash=""
+  local loaf_crust=""
+
+  if [[ ! -s "$hex_file" ]]; then
+    echo "[!] Warning: Generated LOAFCRUMB is empty. Resulting loaf will represent empty content." >&2
+  fi
+
+  crumb_hash=$(loaf_sha256_file "$hex_file") || exit 1
+  loaf_crust="${LOAF_HEADER_PREFIX}${crumb_hash}"
+
+  if [[ -z "$output" || "$output" == "-" ]]; then
+    [[ "$VERBOSE" == true ]] && echo "[i] Writing loaf to stdout" >&2
+    printf "%s " "$loaf_crust"
+    cat "$hex_file"
+  else
+    [[ "$VERBOSE" == true ]] && echo "[i] Baking loaf to $output ..." >&2
+    if ! ( set +o noclobber; { printf "%s " "$loaf_crust"; cat "$hex_file"; } > "$output" ); then
+      echo "[!] Error: Failed to write output file '$output'." >&2
+      exit 1
+    fi
+
+    # File Validation
+    [[ "$VERBOSE" == true ]] && echo "[i] Verifying output file '$output'..." >&2
+    if [[ ! -f "$output" ]]; then
+      (echo && echo "[x] Error: Output file '$output' was not created (check permissions).") >&2
+      exit 1
+    fi
+    if [[ ! -s "$output" ]]; then
+      (echo && echo "[x] Error: Output file '$output' is empty.") >&2
+      exit 1
+    fi
+
+    if loaf_file_ends_with_newline "$output"; then
+      (echo && echo "[x] Error: Output file '$output' has an unexpected trailing newline.") >&2
+      exit 1
+    fi
+
+    [[ "$VERBOSE" == true ]] && echo "[✓] Loaf baked successfully to $output" >&2
+    [[ "$VERBOSE" == true ]] && ls -al "$output"
+    [[ "$VERBOSE" == true ]] && file "$output"
+    exit 0
+  fi
+}
+
 loaf_make() {
   local input="$1"
   local output="$2"
-  local LOAFCRUMB=""
-  local LOAFCRUST=""
-  local OUTPUT_LINE=""
   local archive_name=""
   local input_mode="" # 'pipe', 'file', 'interactive'
+  local hex_file=""
 
   # 1. Determine Input Mode
   if [[ -p /dev/stdin || ! -t 0 ]]; then
     # Input is piped or redirected (not a terminal)
     # We only treat it as pipe mode if the input arg suggests stdin
     if [[ -z "$input" || "$input" == "-" || "$input" == -* ]]; then
-        input_mode="pipe"
+      input_mode="pipe"
     else
-        # Input is piped/redirected, but an input file path was ALSO given.
-        # This is ambiguous. Prioritize the explicit file path.
-        echo "[!] Warning: Input is piped/redirected, but input path '$input' also specified. Using file path." >&2
-        input_mode="file"
+      # Input is piped/redirected, but an input file path was ALSO given.
+      # This is ambiguous. Prioritize the explicit file path.
+      if [[ -p /dev/stdin ]]; then
+        echo "[!] Warning: Input is piped, but input path '$input' also specified. Using file path." >&2
+      fi
+      input_mode="file"
     fi
   elif [[ -z "$input" || "$input" == "-" ]]; then
     # No input file specified OR input is '-', AND stdin IS a terminal
@@ -74,26 +315,28 @@ loaf_make() {
   fi
   [[ "$VERBOSE" == true ]] && echo "[i] Input mode detected: $input_mode" >&2
 
+  hex_file=$(loaf_temp_path "loaf-hex") || exit 1
+
   # 2. Process Input based on Mode
   case "$input_mode" in
     pipe)
       [[ "$VERBOSE" == true ]] && echo "[i] Reading input from stdin pipe/redirect" >&2
-      if [[ "$input" =~ ^-([^[:space:]].*)$ ]]; then
-        archive_name="${BASH_REMATCH[1]}"
+      if [[ -n "$input" && "$input" != "-" ]]; then
+        archive_name="${input#-}"
         [[ "$VERBOSE" == true ]] && echo "[i] Using archive name from argument: '$archive_name'" >&2
       else
         archive_name="-" # Default archive name is '-'
-         [[ "$VERBOSE" == true ]] && echo "[i] Using default archive name: '$archive_name'" >&2
+        [[ "$VERBOSE" == true ]] && echo "[i] Using default archive name: '$archive_name'" >&2
       fi
-      TMPFILE_PATH=$(mktemp /tmp/loaf-stdin-pipe.XXXXXX)
-      ( set +o noclobber; cat > "$TMPFILE_PATH" ) # Read all piped data
+      loaf_validate_archive_name "$archive_name"
 
-      if [[ "$VERBOSE" == false ]]; then
-        LOAFCRUMB=$( { tar --numeric-owner --transform="s|^$(basename "$TMPFILE_PATH")|$archive_name|" -cvpf - -C "$(dirname "$TMPFILE_PATH")" "$(basename "$TMPFILE_PATH")" | gzip -9 | xxd -p -c0; } 2>/dev/null )
-      else
-        echo "[i] Archiving '$TMPFILE_PATH' as '$archive_name'..." >&2
-        LOAFCRUMB=$(tar --numeric-owner --transform="s|^$(basename "$TMPFILE_PATH")|$archive_name|" -cvpf - -C "$(dirname "$TMPFILE_PATH")" "$(basename "$TMPFILE_PATH")" | gzip -9 | xxd -p -c0)
-      fi
+      local archive_dir archive_path archive_parent
+      archive_dir=$(loaf_temp_dir "loaf-stdin") || exit 1
+      archive_path="$archive_dir/$archive_name"
+      archive_parent=$(dirname "$archive_path")
+      mkdir -p "$archive_parent" || { echo "[!] Error creating temporary archive path." >&2; exit 1; }
+      ( set +o noclobber; cat > "$archive_path" ) || { echo "[!] Error reading stdin." >&2; exit 1; }
+      loaf_archive_to_hex_file "$hex_file" -C "$archive_dir" -- "$archive_name" || exit 1
       ;; # End pipe case
 
     interactive)
@@ -102,30 +345,28 @@ loaf_make() {
       archive_name="-" # Default archive name is '-'
       [[ "$VERBOSE" == true ]] && echo "[i] Using default archive name: '$archive_name'" >&2
 
-      TMPFILE_PATH=$(mktemp /tmp/loaf-stdin-interactive.XXXXXX)
+      loaf_validate_archive_name "$archive_name"
+      local archive_dir archive_path
+      archive_dir=$(loaf_temp_dir "loaf-stdin") || exit 1
+      archive_path="$archive_dir/$archive_name"
 
       # Use 'cat' to read from terminal until EOF (Ctrl+D)
       # Redirect output to temp file, disabling noclobber
       # If user presses Ctrl+C, 'cat' will terminate, and 'set -e' will cause script exit.
       # The trap will handle cleanup.
-      ( set +o noclobber; cat > "$TMPFILE_PATH" )
+      ( set +o noclobber; cat > "$archive_path" ) || { echo "[!] Error reading interactive input." >&2; exit 1; }
 
       # If we reach here, Ctrl+D was pressed and cat finished successfully
       [[ "$VERBOSE" == true ]] && echo "[i] Finished reading interactive input." >&2
 
       # Check if temp file is empty (user might just press Ctrl+D immediately)
-      if [[ ! -s "$TMPFILE_PATH" ]]; then
+      if [[ ! -s "$archive_path" ]]; then
           echo "[!] Warning: No input received from interactive session. Loaf will be empty." >&2
           # Allow creating an empty loaf, or exit if preferred:
           # exit 1
       fi
 
-      if [[ "$VERBOSE" == false ]]; then
-        LOAFCRUMB=$( { tar --numeric-owner --transform="s|^$(basename "$TMPFILE_PATH")|$archive_name|" -cvpf - -C "$(dirname "$TMPFILE_PATH")" "$(basename "$TMPFILE_PATH")" | gzip -9 | xxd -p -c0; } 2>/dev/null )
-      else
-        echo "[i] Archiving '$TMPFILE_PATH' as '$archive_name'..." >&2
-        LOAFCRUMB=$(tar --numeric-owner --transform="s|^$(basename "$TMPFILE_PATH")|$archive_name|" -cvpf - -C "$(dirname "$TMPFILE_PATH")" "$(basename "$TMPFILE_PATH")" | gzip -9 | xxd -p -c0)
-      fi
+      loaf_archive_to_hex_file "$hex_file" -C "$archive_dir" -- "$archive_name" || exit 1
       ;; # End interactive case
 
     file)
@@ -147,68 +388,12 @@ loaf_make() {
           exit 1
       fi
       [[ "$VERBOSE" == true ]] && echo "[i] Processing input path: $input" >&2
-      if [[ "$VERBOSE" == false ]]; then
-          LOAFCRUMB=$( { tar --numeric-owner -cvpf - "$input" | gzip -9 | xxd -p -c0; } 2>/dev/null )
-      else
-          LOAFCRUMB=$(tar --numeric-owner -cvpf - "$input" | gzip -9 | xxd -p -c0)
-      fi
+      loaf_archive_to_hex_file "$hex_file" -- "$input" || exit 1
       ;; # End file case
   esac
 
   # 3. Generate Header and Output
-  if [[ -z "$LOAFCRUMB" ]]; then
-      # Handle case where LOAFCRUMB might be empty even if input wasn't (e.g., empty file/dir)
-      # Or if user provided no interactive input and we didn't exit earlier
-      echo "[!] Warning: Generated LOAFCRUMB is empty. Resulting loaf will represent empty content." >&2
-      # Decide if this should be an error or allowed:
-      # exit 1 # Uncomment to make empty loaf an error
-  fi
-
-  # Generate LOAFCRUST (Checksum Header)
-  if [[ "$VERBOSE" == false ]]; then
-      # Group commands, redirect stderr, and explicitly remove null bytes
-      LOAFCRUST=$( { printf "%s" "$LOAFCRUMB" | sha256sum -z --tag | awk '{print $1 $2 $3 $4}' | tr -d '\0'; } 2>/dev/null )
-  else
-      echo "[i] Generating checksum..." >&2
-      LOAFCRUST=$(printf "%s" "$LOAFCRUMB" | sha256sum -z --tag | awk '{print $1 $2 $3 $4}' | tr -d '\0')
-  fi
-
-  OUTPUT_LINE="${LOAFCRUST} ${LOAFCRUMB}"
-
-  # Output Handling
-  if [[ -z "$output" || "$output" == "-" ]]; then
-    [[ "$VERBOSE" == true ]] && echo "[i] Writing loaf to stdout" >&2
-    printf "%s" "$OUTPUT_LINE"
-  else
-    [[ "$VERBOSE" == true ]] && echo "[i] Baking loaf to $output ..." >&2
-    ( set +o noclobber; printf "%s" "$OUTPUT_LINE" > "$output" )
-
-    # File Validation
-    [[ "$VERBOSE" == true ]] && echo "[i] Verifying output file '$output'..." >&2
-    if [[ ! -f "$output" ]]; then
-      (echo && echo "[✗] Error: Output file '$output' was not created (check permissions). ❌") >&2
-      exit 1
-    fi
-    # Allow empty output file if OUTPUT_LINE was empty (empty input case)
-    if [[ ! -s "$output" && -n "$OUTPUT_LINE" ]]; then
-      (echo && echo "[✗] Error: Output file '$output' is empty. ❌") >&2
-      exit 1
-    fi
-
-    local line_count
-    line_count=$(wc -l < "$output")
-    # Allow 0 lines for valid loaf, or potentially 0 if OUTPUT_LINE was empty
-    if [[ "$line_count" -ne 0 ]]; then
-        (echo && echo "[✗] Error: Output file '$output' has unexpected line count ($line_count). Expected 0 for valid loaf. ❌") >&2
-        exit 1
-    fi
-
-    # Success
-    [[ "$VERBOSE" == true ]] && echo "[✓] Loaf baked successfully to $output" >&2
-    [[ "$VERBOSE" == true ]] && ls -al "$output"
-    [[ "$VERBOSE" == true ]] && file "$output"
-    exit 0
-  fi
+  loaf_write_output "$hex_file" "$output"
 }
 
 # Verifies the checksum of a loaf file
@@ -218,97 +403,34 @@ loaf_verify() {
   if [[ -z "$input" ]]; then echo "[!] Error: No input loaf file specified." >&2; exit 1; fi
   if [[ ! -f "$input" || ! -r "$input" ]]; then echo "[!] Error: Input file '$input' not found or not readable." >&2; exit 1; fi
 
-  # Read the first line (or the whole file if no newline)
-  local line_content read_status
-  read -r line_content < "$input"
-  read_status=$? # Capture read's exit status IMMEDIATELY
-
-  # Check for read errors *other* than EOF before newline (status 1)
-  # Also check if line_content is empty (e.g., empty file)
-  # Status 0 (success) or 1 (EOF before newline) are acceptable if content was read.
-  if [[ "$read_status" -gt 1 ]] || [[ -z "$line_content" ]]; then
-      echo "[!] Error: Failed to read content from '$input' (read exit status: $read_status). File might be empty or corrupted." >&2
-      exit 1
-  fi
-  [[ "$VERBOSE" == true ]] && echo "[DEBUG verify] Read status: $read_status. Content read (first 100 chars): ${line_content:0:100}" >&2
-
-  # Check if the beginning of the line matches the header format
-  local header_regex='^SHA256\(-\)=([0-9a-f]{64})'
-  if [[ ! "$line_content" =~ $header_regex ]]; then
-      echo "[!] Error: Invalid or missing SHA256 header format at start of '$input'." >&2
-      echo "[i] Expected format like: SHA256(-)=<64_hex_chars>" >&2
-      echo "[i] Start of file was: '${line_content:0:80}'..." >&2 # Show beginning
-      exit 1
-  fi
-  [[ "$VERBOSE" == true ]] && echo "[DEBUG verify] Header regex matched successfully." >&2
-
-  # Extract embedded hash and calculate actual header length from the match
-  local EMBED_HASH="${BASH_REMATCH[1]}"
-  local actual_header_len=${#BASH_REMATCH[0]} # Length of the matched header string "SHA256(-)=..."
-  [[ "$VERBOSE" == true ]] && echo "[DEBUG verify] Embedded hash: $EMBED_HASH" >&2
-  [[ "$VERBOSE" == true ]] && echo "[DEBUG verify] Matched header length: $actual_header_len" >&2
-
-  # Calculate where hex data should start (position after header + space)
-  # Spec: Header Space HexData
-  local hex_start_index=$((actual_header_len + 1)) # Index is 0-based
-
-  # Check if there is a space after the header in the read content
-  if [[ "${line_content:$actual_header_len:1}" != " " ]]; then
-      # Check if the file *only* contained the header (no space, no data)
-      local file_size
-      file_size=$(stat -c%s "$input" 2>/dev/null || stat -f%z "$input")
-      if [[ "$file_size" -eq "$actual_header_len" ]]; then
-          # This violates the "Header Space HexData" format, even for empty data.
-          echo "[!] Error: File contains only the header string, missing the required space separator." >&2
-      else
-          # Header is present, but the character immediately after isn't a space.
-          echo "[!] Error: Invalid format. Expected a space immediately after the header string in '$input'." >&2
-          echo "[i] Character found at index $actual_header_len: '$(printf "%q" "${line_content:$actual_header_len:1}")'" >&2
-      fi
-      exit 1
-  fi
-  [[ "$VERBOSE" == true ]] && echo "[DEBUG verify] Space separator found after header." >&2
-
-  # Extract hex data (everything after the header and the space)
-  # Use substring extraction from the read line_content
-  local HEX="${line_content:$hex_start_index}"
-  [[ "$VERBOSE" == true ]] && echo "[DEBUG verify] Extracted HEX data length: ${#HEX}" >&2
-
-  # Compare Hashes
+  local EMBED_HASH=""
   local CALC_HASH=""
+  local file_size=""
+  local payload_bytes=""
+  local payload_file=""
 
-  # Calculate hash
-  if [[ -n "$HEX" ]]; then
-      [[ "$VERBOSE" == true ]] && echo "[DEBUG verify] Calculating checksum for non-empty hex data..." >&2
-      if [[ "$VERBOSE" == false ]]; then
-          CALC_HASH=$( { printf "%s" "$HEX" | sha256sum --tag | awk '{print $4}'; } 2>/dev/null )
-      else
-          CALC_HASH=$(printf "%s" "$HEX" | sha256sum --tag | awk '{print $4}')
-      fi
-  else
-      # If HEX is empty (meaning file ended exactly after "Header Space")
-       [[ "$VERBOSE" == true ]] && echo "[DEBUG verify] Calculating checksum for empty data..." >&2
-       if [[ "$VERBOSE" == false ]]; then
-           CALC_HASH=$( { printf "" | sha256sum --tag | awk '{print $4}'; } 2>/dev/null )
-       else
-           CALC_HASH=$(printf "" | sha256sum --tag | awk '{print $4}')
-       fi
-  fi
+  EMBED_HASH=$(loaf_read_header_hash "$input") || exit 1
+  [[ "$VERBOSE" == true ]] && echo "[DEBUG verify] Embedded hash: $EMBED_HASH" >&2
 
-  # Check if sha256sum failed
-  if [[ -z "$CALC_HASH" ]]; then
-      echo "[!] Error: Failed to calculate checksum. sha256sum might be missing or failed." >&2
-      # Attempt to capture sha256sum error if verbose
-      if [[ "$VERBOSE" == true ]]; then
-          echo "[DEBUG verify] Running sha256sum again to capture error:" >&2
-          if [[ -n "$HEX" ]]; then
-              printf "%s" "$HEX" | sha256sum --tag || true # Allow failure to see error
-          else
-              printf "" | sha256sum --tag || true # Allow failure to see error
-          fi
-      fi
+  file_size=$(loaf_file_size "$input") || { echo "[!] Error: Failed to read size for '$input'." >&2; exit 1; }
+  payload_bytes=$((file_size - LOAF_HEADER_LEN))
+
+  if loaf_file_ends_with_newline "$input"; then
+    payload_file=$(loaf_temp_path "loaf-payload") || exit 1
+    if ! loaf_payload_stream "$input" > "$payload_file"; then
+      echo "[!] Error: Failed to read payload from '$input'." >&2
       exit 1
+    fi
+    loaf_chomp_final_newline "$payload_file" || exit 1
+    payload_bytes=$((payload_bytes - 1))
+    CALC_HASH=$(loaf_sha256_file "$payload_file") || exit 1
+  else
+    if ! CALC_HASH=$(loaf_payload_stream "$input" | loaf_sha256_stream); then
+      echo "[!] Error: Failed to read or hash payload from '$input'." >&2
+      exit 1
+    fi
   fi
+  [[ "$VERBOSE" == true ]] && echo "[DEBUG verify] Payload bytes to hash: $payload_bytes" >&2
   [[ "$VERBOSE" == true ]] && echo "[DEBUG verify] Calculated hash: $CALC_HASH" >&2
 
   # Output verification status
@@ -366,34 +488,15 @@ loaf_extract() {
     mkdir -p "$output_dir" || { echo "[!] Error creating output directory '$output_dir'." >&2; exit 1; }
   fi
 
-  # --- Read Loaf File Header ---
-  local line_content read_status
-  read -r line_content < "$input"
-  read_status=$?
-  if [[ "$read_status" -gt 1 ]] || [[ -z "$line_content" ]]; then
-      echo "[!] Error: Failed to read content from '$input' (read exit status: $read_status)." >&2; exit 1;
-  fi
-  [[ "$VERBOSE" == true ]] && echo "[DEBUG extract] Read status: $read_status. Content read (first 100 chars): ${line_content:0:100}" >&2
-
   # --- Validate Header Format ---
-  local header_regex='^SHA256\(-\)=([0-9a-f]{64})'
-  if [[ ! "$line_content" =~ $header_regex ]]; then
-    echo "[!] Error: Invalid or missing SHA256 header format at start of '$input'." >&2; exit 1;
-  fi
-  [[ "$VERBOSE" == true ]] && echo "[DEBUG extract] Header regex matched successfully." >&2
-
-  # --- Extract Hex Data ---
-  local actual_header_len=${#BASH_REMATCH[0]}
-  local hex_start_index=$((actual_header_len + 1))
-  if [[ "${line_content:$actual_header_len:1}" != " " ]]; then
-      echo "[!] Error: Invalid format. Expected a space immediately after the header string." >&2; exit 1;
-  fi
-  [[ "$VERBOSE" == true ]] && echo "[DEBUG extract] Space separator found after header." >&2
-  local HEX="${line_content:$hex_start_index}"
-  [[ "$VERBOSE" == true ]] && echo "[DEBUG extract] Extracted HEX data length: ${#HEX}" >&2
+  local embed_hash=""
+  local file_size=""
+  embed_hash=$(loaf_read_header_hash "$input") || exit 1
+  [[ "$VERBOSE" == true ]] && echo "[DEBUG extract] Embedded hash: $embed_hash" >&2
 
   # --- Handle Empty Archive ---
-  if [[ -z "$HEX" ]]; then
+  file_size=$(loaf_file_size "$input") || { echo "[!] Error: Failed to read size for '$input'." >&2; exit 1; }
+  if [[ "$file_size" -le "$LOAF_HEADER_LEN" ]]; then
       echo "[✓] Loaf extracted successfully (archive was empty)." >&2; exit 0;
   fi
 
@@ -412,69 +515,69 @@ loaf_extract() {
     trap cleanup_temp_tar EXIT INT TERM HUP
 
     if [[ "$output_to_stdout" == true ]]; then
-        # --- STDOUT Output ---
-        if [[ "$stdout_mode" == "raw" ]]; then
-            # Raw concatenation using tar -O
-            [[ "$VERBOSE" == true ]] && echo "[DEBUG extract] Pipeline (raw stdout): printf | xxd | gunzip | tar xOf -" >&2
-            printf "%s" "$HEX" | xxd -r -p | gunzip -c | tar xOf -
+      # --- STDOUT Output ---
+      if [[ "$stdout_mode" == "raw" ]]; then
+        # Raw concatenation using tar -O
+        [[ "$VERBOSE" == true ]] && echo "[DEBUG extract] Pipeline (raw stdout): tail | xxd | gunzip | tar xOf -" >&2
+        loaf_payload_stream "$input" | xxd -r -p | gunzip -c | tar xOf -
 
-        elif [[ "$stdout_mode" == "delimited" ]]; then
-            # Delimited output using a temporary file for the tar stream
-            temp_tar_stream_file=$(mktemp /tmp/loaf-tar-stream.XXXXXX)
-            [[ "$VERBOSE" == true ]] && echo "[DEBUG extract] Decoding/Decompressing tar stream to '$temp_tar_stream_file'..." >&2
+      elif [[ "$stdout_mode" == "delimited" ]]; then
+        # Delimited output using a temporary file for the tar stream
+        temp_tar_stream_file=$(loaf_temp_path "loaf-tar-stream") || exit 1
+        [[ "$VERBOSE" == true ]] && echo "[DEBUG extract] Decoding/Decompressing tar stream to '$temp_tar_stream_file'..." >&2
 
-            # Decode/Decompress HEX into the temporary file
-            printf "%s" "$HEX" | xxd -r -p | gunzip -c > "$temp_tar_stream_file"
-            if [[ $? -ne 0 ]]; then
-                echo "[!] Error during xxd/gunzip stage into temp file." >&2
-                exit 1 # Exit subshell
-            fi
-            # Check if temp file was created and has content
-            if [[ ! -s "$temp_tar_stream_file" ]]; then
-                 echo "[!] Error: Decoded/decompressed tar stream is empty." >&2
-                 exit 1
-            fi
-
-            [[ "$VERBOSE" == true ]] && echo "[DEBUG extract] Iterating through tar stream from '$temp_tar_stream_file' for delimited output..." >&2
-            local first_file=true # Flag to handle delimiter placement
-
-            # List files using the temp file, then loop
-            while IFS= read -r filename; do
-                # Skip directories explicitly
-                if [[ "$filename" == */ ]]; then
-                    [[ "$VERBOSE" == true ]] && echo "[DEBUG extract] Skipping directory: $filename" >&2
-                    continue
-                fi
-
-                # Print delimiter *before* the file content, except for the first file
-                if [[ "$first_file" == false ]]; then
-                    printf "%s" "$delimiter"
-                else
-                    first_file=false # Mark that the first file is being processed
-                fi
-
-                # Extract the specific file's content to stdout, reading from the temp file
-                [[ "$VERBOSE" == true ]] && echo "[DEBUG extract] Extracting to stdout: $filename" >&2
-                # Use < redirection from the temp file
-                tar xOf - "$filename" < "$temp_tar_stream_file" || {
-                    echo "[!] Error extracting content for '$filename' during delimited output." >&2
-                    # Decide whether to continue or exit on error
-                    continue # Skip to next file on error
-                }
-
-            # Read file list from the temp file
-            done < <(tar tf - < "$temp_tar_stream_file")
-            [[ "$VERBOSE" == true ]] && echo "[DEBUG extract] Finished iterating tar stream." >&2
-            # Temp file will be removed by the subshell's EXIT trap
+        # Decode/Decompress HEX into the temporary file
+        loaf_payload_stream "$input" | xxd -r -p | gunzip -c > "$temp_tar_stream_file"
+        if [[ $? -ne 0 ]]; then
+          echo "[!] Error during xxd/gunzip stage into temp file." >&2
+          exit 1 # Exit subshell
+        fi
+        # Check if temp file was created and has content
+        if [[ ! -s "$temp_tar_stream_file" ]]; then
+          echo "[!] Error: Decoded/decompressed tar stream is empty." >&2
+          exit 1
         fi
 
+        [[ "$VERBOSE" == true ]] && echo "[DEBUG extract] Iterating through tar stream from '$temp_tar_stream_file' for delimited output..." >&2
+        local first_file=true # Flag to handle delimiter placement
+
+        # List files using the temp file, then loop
+        while IFS= read -r filename; do
+          # Skip directories explicitly
+          if [[ "$filename" == */ ]]; then
+            [[ "$VERBOSE" == true ]] && echo "[DEBUG extract] Skipping directory: $filename" >&2
+            continue
+          fi
+
+          # Print delimiter *before* the file content, except for the first file
+          if [[ "$first_file" == false ]]; then
+            printf "%s" "$delimiter"
+          else
+            first_file=false # Mark that the first file is being processed
+          fi
+
+          # Extract the specific file's content to stdout, reading from the temp file
+          [[ "$VERBOSE" == true ]] && echo "[DEBUG extract] Extracting to stdout: $filename" >&2
+          # Use < redirection from the temp file
+          tar xOf - "$filename" < "$temp_tar_stream_file" || {
+            echo "[!] Error extracting content for '$filename' during delimited output." >&2
+            # Decide whether to continue or exit on error
+            continue # Skip to next file on error
+          }
+
+        # Read file list from the temp file
+        done < <(tar tf - < "$temp_tar_stream_file")
+        [[ "$VERBOSE" == true ]] && echo "[DEBUG extract] Finished iterating tar stream." >&2
+        # Temp file will be removed by the subshell's EXIT trap
+      fi
+
     else
-        # --- Directory Output ---
-        local tar_opts=""
-        if [[ "$VERBOSE" == true ]]; then tar_opts="xvpf -"; else tar_opts="xpf -"; fi
-        local tar_cmd=("tar" $tar_opts "-C" "$output_dir")
-        [[ "$VERBOSE" == true ]] && echo "[DEBUG extract] Pipeline (directory): printf | xxd | gunzip | ${tar_cmd[*]}" >&2
-        printf "%s" "$HEX" | xxd -r -p | gunzip -c | "${tar_cmd[@]}"
+      # --- Directory Output ---
+      local tar_opts=""
+      if [[ "$VERBOSE" == true ]]; then tar_opts="xvpf -"; else tar_opts="xpf -"; fi
+      local tar_cmd=("tar" $tar_opts "-C" "$output_dir")
+      [[ "$VERBOSE" == true ]] && echo "[DEBUG extract] Pipeline (directory): tail | xxd | gunzip | ${tar_cmd[*]}" >&2
+      loaf_payload_stream "$input" | xxd -r -p | gunzip -c | "${tar_cmd[@]}"
     fi
 
   ) || pipeline_exit_status=$? # Capture exit status of the subshell
