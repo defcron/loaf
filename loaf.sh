@@ -765,39 +765,57 @@ Examples:
 EOF
 }
 
+# True for any command name in the make/c/cf family (kept as one function so
+# the option-parsing pass below and the main dispatch can't drift apart).
+loaf_is_make_command() {
+  case "$1" in
+    make|c|cf|create|new|loaf|bake|knead|prepare|cook|spawn|generate|mix|do|cause|be|conjure|press|burn|stir|whip|fold|build|embue|form|shape|roll) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 # --- Option Parsing ---
-# -v is recognized anywhere in the argument list (before or after the
-# subcommand), not just before it. getopts stops scanning at the first
-# non-option argument, which meant a flag placed after the subcommand (e.g.
-# 'loaf.sh make in.txt -v out.loaf') used to be silently reinterpreted as a
-# positional argument instead of being treated as an option -- with the old
-# <input> <output> signature that could send the flag through as an output
-# path and clobber a file named '-v'. This filters it out unconditionally.
+# -v/--verbose is always recognized *before* the subcommand word.
 #
-# --verbose (the long form) is only recognized *before* the subcommand word.
-# After it, 'extract'/'x' accepts a literal '--<DELIM>' target (e.g.
-# 'loaf.sh x foo.loaf --verbose' means "delimit with the string 'verbose'"),
-# so unconditionally stripping --verbose there would silently swallow a
-# legitimate, documented argument instead of an option.
+# After the subcommand word, whether -v is still recognized as a flag
+# depends on the command: for the make/c/cf family it's still recognized
+# anywhere, since that variadic <output> <input...> grammar has no place a
+# bare '-v' is a meaningful operand -- this is the actual fix for the
+# original bug, where getopts stopped scanning at the first non-option
+# argument and let a flag placed after the subcommand (e.g.
+# 'loaf.sh make in.txt -v out.loaf') get silently reinterpreted as a
+# positional argument, which with the old <input> <output> order could send
+# it through as the output path and clobber a file literally named '-v'.
+#
+# For 'verify'/'extract'/'x' (and anything unrecognized), -v and --verbose
+# are left alone after the subcommand: 'extract's target grammar accepts a
+# literal directory named '-v', or a '--<DELIM>' string (including
+# '--verbose' as the literal delimiter 'verbose') -- stripping either there
+# would silently reinterpret a legitimate operand as a flag, the same class
+# of bug this is fixing in the first place.
 _LOAF_PRE=()
 _LOAF_POST=()
 _loaf_seen_cmd=false
+_loaf_cmd=""
 for _loaf_arg in "$@"; do
   if [[ "$_loaf_seen_cmd" == false ]]; then
     case "$_loaf_arg" in
       -v|--verbose) VERBOSE=true; continue ;;
     esac
+    _loaf_cmd="$_loaf_arg"
     _LOAF_PRE+=("$_loaf_arg")
     _loaf_seen_cmd=true
-  else
+  elif [[ -z "$_loaf_cmd" ]] || loaf_is_make_command "$_loaf_cmd"; then
     case "$_loaf_arg" in
       -v) VERBOSE=true ;;
       *) _LOAF_POST+=("$_loaf_arg") ;;
     esac
+  else
+    _LOAF_POST+=("$_loaf_arg")
   fi
 done
 set -- "${_LOAF_PRE[@]}" "${_LOAF_POST[@]}"
-unset _LOAF_PRE _LOAF_POST _loaf_seen_cmd _loaf_arg
+unset _LOAF_PRE _LOAF_POST _loaf_seen_cmd _loaf_arg _loaf_cmd
 
 # --- Main Command Dispatch ---
 COMMAND="${1:-}"
@@ -807,7 +825,7 @@ if [[ "$VERBOSE" == true ]]; then
   echo "[i] Remaining arguments: $*" >&2
 fi
 
-if [[ "$COMMAND" == "make" || "$COMMAND" == "c" || "$COMMAND" == "cf" || "$COMMAND" == "create" || "$COMMAND" == "new" || "$COMMAND" == "loaf" || "$COMMAND" == "bake" || "$COMMAND" == "knead" || "$COMMAND" == "prepare" || "$COMMAND" == "cook" || "$COMMAND" == "spawn" || "$COMMAND" == "generate" || "$COMMAND" == "mix" || "$COMMAND" == "do" || "$COMMAND" == "cause" || "$COMMAND" == "be" || "$COMMAND" == "conjure" || "$COMMAND" == "press" || "$COMMAND" == "burn" || "$COMMAND" == "stir" || "$COMMAND" == "whip" || "$COMMAND" == "fold" || "$COMMAND" == "build" || "$COMMAND" == "embue" || "$COMMAND" == "form" || "$COMMAND" == "shape" || "$COMMAND" == "roll" ]]; then
+if loaf_is_make_command "$COMMAND"; then
   # Tar-style: <output> comes right after the command, remaining args are
   # the variadic input list (possibly empty, meaning "read stdin").
   loaf_make "${1:-}" "${@:2}"
