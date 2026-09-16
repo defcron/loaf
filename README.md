@@ -18,32 +18,39 @@ LoaF is baked fresh for:
 
 Let's get baking! (`loaf.sh` is assumed to be executable in the current path, e.g., `./loaf.sh`)
 
-### Creating a LoaF (`make`, `c`)
+### Creating a LoaF (`make`, `c`, `cf`)
+
+`c`'s argument order is tar-style: the output comes right after the command, and one or more inputs follow it, variadic and last (`loaf.sh c <output> <input1> [input2 ...]`). `cf` is an exact alias for `c`, spelled the same way as gptgif's `cf` for easier recall.
 
 ```bash
 # Archive a file/directory into a .loaf file
-./loaf.sh c path/to/input my_archive.loaf
+./loaf.sh c my_archive.loaf path/to/input
+
+# Archive multiple files/directories into ONE .loaf file
+./loaf.sh cf my_archive.loaf path/to/input1 path/to/input2 path/to/dir
 
 # Archive a file/directory and print the .loaf content to stdout
-./loaf.sh c path/to/input
+./loaf.sh c - path/to/input
 
 # Pipe data into a .loaf file (archive contains 'some_data' contents in a file named '-' by default)
-cat some_data | ./loaf.sh c - my_data.loaf
+cat some_data | ./loaf.sh c my_data.loaf -
 
 # Pipe data and print the .loaf content to stdout (archive contains 'some_data' contents in a file named '-' by default)
-cat some_data | ./loaf.sh c
+cat some_data | ./loaf.sh c -
 
 # Pipe data, name the file inside the archive `image.png`, save the .loaf archive to a file named image.png.loaf
-cat image.png | ./loaf.sh c -image.png image.png.loaf
+cat image.png | ./loaf.sh c image.png.loaf -image.png
 
 # Pipe data, give the archived file a name, print the .loaf to stdout
-cat image.png | ./loaf.sh c -image.png
+cat image.png | ./loaf.sh c - -image.png
 
 # Create a .loaf interactively and save it to file named 'interactive.loaf' (type the contents you want to archive in the .loaf file, then press Enter, then press Ctrl+D to finish and save)
-./loaf.sh make - interactive.loaf
+./loaf.sh c interactive.loaf
 
-# Use -v for verbose output during any operation
-./loaf.sh -v c path/to/input my_archive.loaf
+# Use -v for verbose output during any operation -- it's recognized anywhere
+# on the command line, not just before the subcommand
+./loaf.sh -v c my_archive.loaf path/to/input
+./loaf.sh c my_archive.loaf path/to/input -v
 ```
 
 ## Verifying a LoaF (`verify`)

@@ -378,6 +378,28 @@ loaf_make() {
     done
   fi
 
+  # Fast path: exactly one real (non-stdin) input needs no staging at all --
+  # tar it directly, exactly like the old single-input code path did. This
+  # matters because staging (below) extracts into a temp directory as the
+  # invoking user, which cannot restore another user's original uid/gid
+  # (e.g. archiving a root-owned file loses its ownership metadata, becoming
+  # owned by whoever ran loaf.sh instead). Skipping staging for the common
+  # single-input case avoids that regression entirely; combining two or more
+  # real inputs (or an input plus stdin) still needs staging to unify them
+  # into one tar stream, and does carry that ownership caveat.
+  if [[ "${#inputs[@]}" -eq 1 && "${inputs[0]}" != "-" && "${inputs[0]}" != -* ]]; then
+    local only_input="${inputs[0]}"
+    if [[ ! -e "$only_input" ]]; then
+      echo "[!] Error: Input path '$only_input' does not exist." >&2
+      exit 1
+    fi
+    loaf_validate_input_path "$only_input"
+    [[ "$VERBOSE" == true ]] && echo "[i] Processing input path: $only_input" >&2
+    loaf_archive_to_hex_file "$hex_file" -- "$only_input" || exit 1
+    loaf_write_output "$hex_file" "$output"
+    return
+  fi
+
   local staging
   staging=$(loaf_temp_dir "loaf-stage") || exit 1
   # Full normalized destination paths staged so far, used for exact-collision
@@ -708,6 +730,11 @@ last and variadic, just like 'tar cf output.tar file1 file2 ...'):
            into one loaf. If no <input> is given at all: reads stdin if
            piped/redirected, or reads interactively if stdin is a terminal
            (End with Ctrl+D), archived under the name '-'.
+           Note: combining two or more inputs (or an input with stdin) into
+           one loaf stages them through a temp directory first, which
+           records their ownership as the user running loaf.sh rather than
+           each input's original owner. A single real path is archived
+           directly and keeps its real ownership metadata.
   The output path is checked against every input path up front; loaf refuses
   to run if writing <output> would overwrite one of the inputs.
 
@@ -739,22 +766,38 @@ EOF
 }
 
 # --- Option Parsing ---
-# -v/--verbose is recognized anywhere in the argument list (before or after
-# the subcommand), not just before it. getopts stops scanning at the first
+# -v is recognized anywhere in the argument list (before or after the
+# subcommand), not just before it. getopts stops scanning at the first
 # non-option argument, which meant a flag placed after the subcommand (e.g.
 # 'loaf.sh make in.txt -v out.loaf') used to be silently reinterpreted as a
 # positional argument instead of being treated as an option -- with the old
 # <input> <output> signature that could send the flag through as an output
 # path and clobber a file named '-v'. This filters it out unconditionally.
-_LOAF_ARGS=()
+#
+# --verbose (the long form) is only recognized *before* the subcommand word.
+# After it, 'extract'/'x' accepts a literal '--<DELIM>' target (e.g.
+# 'loaf.sh x foo.loaf --verbose' means "delimit with the string 'verbose'"),
+# so unconditionally stripping --verbose there would silently swallow a
+# legitimate, documented argument instead of an option.
+_LOAF_PRE=()
+_LOAF_POST=()
+_loaf_seen_cmd=false
 for _loaf_arg in "$@"; do
-  case "$_loaf_arg" in
-    -v|--verbose) VERBOSE=true ;;
-    *) _LOAF_ARGS+=("$_loaf_arg") ;;
-  esac
+  if [[ "$_loaf_seen_cmd" == false ]]; then
+    case "$_loaf_arg" in
+      -v|--verbose) VERBOSE=true; continue ;;
+    esac
+    _LOAF_PRE+=("$_loaf_arg")
+    _loaf_seen_cmd=true
+  else
+    case "$_loaf_arg" in
+      -v) VERBOSE=true ;;
+      *) _LOAF_POST+=("$_loaf_arg") ;;
+    esac
+  fi
 done
-set -- "${_LOAF_ARGS[@]}"
-unset _LOAF_ARGS _loaf_arg
+set -- "${_LOAF_PRE[@]}" "${_LOAF_POST[@]}"
+unset _LOAF_PRE _LOAF_POST _loaf_seen_cmd _loaf_arg
 
 # --- Main Command Dispatch ---
 COMMAND="${1:-}"
