@@ -212,6 +212,48 @@ loaf_validate_archive_name() {
   fi
 }
 
+# Like loaf_validate_archive_name, but for real filesystem input paths: an
+# absolute path is fine (tar strips the leading '/' when archiving, so it
+# can't escape the staging directory), but any '..' path component would let
+# a crafted input path stage itself outside the temp staging directory, so
+# those are rejected the same way stdin archive names are.
+loaf_validate_input_path() {
+  local input_path="$1"
+
+  if [[ -z "$input_path" || "$input_path" == "." || "$input_path" == ".." || "$input_path" == ../* || "$input_path" == */../* || "$input_path" == */.. ]]; then
+    echo "[!] Error: Invalid input path '$input_path'." >&2
+    echo "[i] Input paths must not contain '..' path components. Use an absolute path or 'cd' first instead." >&2
+    exit 1
+  fi
+}
+
+# Best-effort canonical (absolute, symlink-resolved-directory) form of a path,
+# for comparing an output path against input paths so we can refuse to let an
+# archive silently overwrite one of its own inputs. Falls back gracefully if
+# 'realpath' isn't available and/or the path doesn't exist yet.
+loaf_canon_path() {
+  local p="$1"
+  local dir base
+
+  if command -v realpath >/dev/null 2>&1; then
+    if [[ -e "$p" ]]; then
+      realpath -- "$p" 2>/dev/null && return
+    fi
+  fi
+
+  if [[ -d "$p" ]]; then
+    (cd -- "$p" 2>/dev/null && pwd -P) && return
+  fi
+
+  dir=$(dirname -- "$p")
+  base=$(basename -- "$p")
+  if [[ -d "$dir" ]]; then
+    printf "%s/%s" "$(cd -- "$dir" 2>/dev/null && pwd -P)" "$base"
+  else
+    printf "%s" "$p"
+  fi
+}
+
 loaf_archive_to_hex_file() {
   local hex_file="$1"
   local tar_opts="-cpf"
@@ -282,115 +324,146 @@ loaf_write_output() {
 }
 
 loaf_make() {
-  local input="$1"
-  local output="$2"
-  local archive_name=""
-  local input_mode="" # 'pipe', 'file', 'interactive'
+  local output="$1"
+  shift
+  local inputs=("$@")
   local hex_file=""
-
-  # 1. Determine Input Mode
-  if [[ -p /dev/stdin || ! -t 0 ]]; then
-    # Input is piped or redirected (not a terminal)
-    # We only treat it as pipe mode if the input arg suggests stdin
-    if [[ -z "$input" || "$input" == "-" || "$input" == -* ]]; then
-      input_mode="pipe"
-    else
-      # Input is piped/redirected, but an input file path was ALSO given.
-      # This is ambiguous. Prioritize the explicit file path.
-      if [[ -p /dev/stdin ]]; then
-        echo "[!] Warning: Input is piped, but input path '$input' also specified. Using file path." >&2
-      fi
-      input_mode="file"
-    fi
-  elif [[ -z "$input" || "$input" == "-" ]]; then
-    # No input file specified OR input is '-', AND stdin IS a terminal
-    input_mode="interactive"
-  elif [[ -n "$input" ]]; then
-    # Input is specified and not '-' (must be a file/path)
-    input_mode="file"
-  else
-     # Should not be reachable, but good practice
-     echo "[!] Error: Cannot determine input mode." >&2
-     exit 1
-  fi
-  [[ "$VERBOSE" == true ]] && echo "[i] Input mode detected: $input_mode" >&2
 
   hex_file=$(loaf_temp_path "loaf-hex") || exit 1
 
-  # 2. Process Input based on Mode
-  case "$input_mode" in
-    pipe)
-      [[ "$VERBOSE" == true ]] && echo "[i] Reading input from stdin pipe/redirect" >&2
-      if [[ -n "$input" && "$input" != "-" ]]; then
-        archive_name="${input#-}"
-        [[ "$VERBOSE" == true ]] && echo "[i] Using archive name from argument: '$archive_name'" >&2
-      else
-        archive_name="-" # Default archive name is '-'
-        [[ "$VERBOSE" == true ]] && echo "[i] Using default archive name: '$archive_name'" >&2
+  # 1. No inputs given at all: fall back to reading stdin (piped or
+  #    interactive), archived under the default name '-', exactly like a
+  #    bare invocation always has.
+  if [[ "${#inputs[@]}" -eq 0 ]]; then
+    local archive_name="-"
+    local archive_dir archive_path archive_parent
+    loaf_validate_archive_name "$archive_name"
+    archive_dir=$(loaf_temp_dir "loaf-stdin") || exit 1
+    archive_path="$archive_dir/$archive_name"
+    archive_parent=$(dirname "$archive_path")
+    mkdir -p "$archive_parent" || { echo "[!] Error creating temporary archive path." >&2; exit 1; }
+
+    if [[ -p /dev/stdin || ! -t 0 ]]; then
+      [[ "$VERBOSE" == true ]] && echo "[i] No input given; reading from stdin pipe/redirect" >&2
+    else
+      [[ "$VERBOSE" == true ]] && echo "[i] No input given; reading interactively from terminal (End with Ctrl+D)" >&2
+    fi
+    ( set +o noclobber; cat > "$archive_path" ) || { echo "[!] Error reading stdin." >&2; exit 1; }
+    if [[ ! -s "$archive_path" && -t 0 ]]; then
+      echo "[!] Warning: No input received from interactive session. Loaf will be empty." >&2
+    fi
+
+    loaf_archive_to_hex_file "$hex_file" -C "$archive_dir" -- "$archive_name" || exit 1
+    loaf_write_output "$hex_file" "$output"
+    return
+  fi
+
+  # 2. One or more explicit inputs given: each is either a real
+  #    file/directory path, or a stdin reference ('-' / '-name.ext', tar-style
+  #    only meaningful once since stdin can only be consumed a single time).
+  #
+  # Refuse up front to let the output clobber one of its own inputs -- the
+  # new <output> <input...> order makes this an easy habit-driven mistake
+  # coming from the old <input> <output> order.
+  if [[ -n "$output" && "$output" != "-" ]]; then
+    local out_canon token in_canon
+    out_canon=$(loaf_canon_path "$output")
+    for token in "${inputs[@]}"; do
+      [[ "$token" == "-" || "$token" == -* ]] && continue
+      in_canon=$(loaf_canon_path "$token")
+      if [[ -n "$out_canon" && "$out_canon" == "$in_canon" ]]; then
+        echo "[!] Error: Refusing to overwrite input path '$token' with output '$output' (same file)." >&2
+        exit 1
       fi
+    done
+  fi
+
+  local staging
+  staging=$(loaf_temp_dir "loaf-stage") || exit 1
+  # Full normalized destination paths staged so far, used for exact-collision
+  # detection below. Kept as a plain array (not an associative array) since
+  # this needs to run on bash 3.2 (macOS's stock /bin/bash), which has no
+  # 'declare -A' support.
+  local staged_paths=()
+  local stdin_used=false
+  local have_stdin_token=false
+  local token
+
+  for token in "${inputs[@]}"; do
+    if [[ "$token" == "-" || "$token" == -* ]]; then
+      have_stdin_token=true
+    fi
+  done
+
+  # If stdin is piped/redirected but none of the inputs actually reference
+  # it, drain it in the background instead of leaving it unread -- an
+  # upstream writer in a pipeline could otherwise block once its pipe buffer
+  # fills, since nothing in this process would ever read the rest of it.
+  if [[ "$have_stdin_token" == false && ( -p /dev/stdin || ! -t 0 ) ]]; then
+    cat /dev/stdin >/dev/null 2>&1 &
+    disown 2>/dev/null || true
+  fi
+
+  for token in "${inputs[@]}"; do
+    if [[ "$token" == "-" || "$token" == -* ]]; then
+      if [[ "$stdin_used" == true ]]; then
+        echo "[!] Error: Only one stdin ('-' or '-name') input is allowed per archive; stdin can only be read once." >&2
+        exit 1
+      fi
+      stdin_used=true
+
+      local archive_name="${token#-}"
+      [[ -z "$archive_name" ]] && archive_name="-"
       loaf_validate_archive_name "$archive_name"
 
-      local archive_dir archive_path archive_parent
-      archive_dir=$(loaf_temp_dir "loaf-stdin") || exit 1
-      archive_path="$archive_dir/$archive_name"
-      archive_parent=$(dirname "$archive_path")
-      mkdir -p "$archive_parent" || { echo "[!] Error creating temporary archive path." >&2; exit 1; }
-      ( set +o noclobber; cat > "$archive_path" ) || { echo "[!] Error reading stdin." >&2; exit 1; }
-      loaf_archive_to_hex_file "$hex_file" -C "$archive_dir" -- "$archive_name" || exit 1
-      ;; # End pipe case
-
-    interactive)
-      [[ "$VERBOSE" == true ]] && echo "[i] Reading input interactively from terminal (End with Ctrl+D)" >&2
-      # For interactive mode, the first arg ('-' or missing) doesn't specify archive name
-      archive_name="-" # Default archive name is '-'
-      [[ "$VERBOSE" == true ]] && echo "[i] Using default archive name: '$archive_name'" >&2
-
-      loaf_validate_archive_name "$archive_name"
-      local archive_dir archive_path
-      archive_dir=$(loaf_temp_dir "loaf-stdin") || exit 1
-      archive_path="$archive_dir/$archive_name"
-
-      # Use 'cat' to read from terminal until EOF (Ctrl+D)
-      # Redirect output to temp file, disabling noclobber
-      # If user presses Ctrl+C, 'cat' will terminate, and 'set -e' will cause script exit.
-      # The trap will handle cleanup.
-      ( set +o noclobber; cat > "$archive_path" ) || { echo "[!] Error reading interactive input." >&2; exit 1; }
-
-      # If we reach here, Ctrl+D was pressed and cat finished successfully
-      [[ "$VERBOSE" == true ]] && echo "[i] Finished reading interactive input." >&2
-
-      # Check if temp file is empty (user might just press Ctrl+D immediately)
-      if [[ ! -s "$archive_path" ]]; then
-          echo "[!] Warning: No input received from interactive session. Loaf will be empty." >&2
-          # Allow creating an empty loaf, or exit if preferred:
-          # exit 1
-      fi
-
-      loaf_archive_to_hex_file "$hex_file" -C "$archive_dir" -- "$archive_name" || exit 1
-      ;; # End interactive case
-
-    file)
-      # Handle literal file named '-'
-      if [[ "$input" == "-" ]]; then
-          if [[ -e "-" ]]; then
-              [[ "$VERBOSE" == true ]] && echo "[i] Processing literal file named '-'" >&2
-              input="./-" # Use relative path for clarity
-          else
-              # This case should ideally not be reached if mode detection is correct
-              echo "[!] Error: Input is '-', stdin is a terminal, and file '-' not found." >&2
-              exit 1
-          fi
-      fi
-
-      # Handle regular file/directory path
-      if [[ ! -e "$input" ]]; then
-          echo "[!] Error: Input path '$input' does not exist." >&2
+      local already_staged=""
+      for already_staged in "${staged_paths[@]}"; do
+        if [[ "$already_staged" == "$archive_name" ]]; then
+          echo "[!] Error: Duplicate archive entry '$archive_name' from multiple inputs." >&2
           exit 1
+        fi
+      done
+      staged_paths+=("$archive_name")
+
+      local dest="$staging/$archive_name"
+      mkdir -p "$(dirname -- "$dest")" || { echo "[!] Error creating staging path for stdin input." >&2; exit 1; }
+      if [[ -t 0 ]]; then
+        [[ "$VERBOSE" == true ]] && echo "[i] Reading '$archive_name' interactively from terminal (End with Ctrl+D)" >&2
+      else
+        [[ "$VERBOSE" == true ]] && echo "[i] Reading '$archive_name' from stdin pipe/redirect" >&2
       fi
-      [[ "$VERBOSE" == true ]] && echo "[i] Processing input path: $input" >&2
-      loaf_archive_to_hex_file "$hex_file" -- "$input" || exit 1
-      ;; # End file case
-  esac
+      ( set +o noclobber; cat > "$dest" ) || { echo "[!] Error reading stdin for '$archive_name'." >&2; exit 1; }
+    else
+      if [[ ! -e "$token" ]]; then
+        echo "[!] Error: Input path '$token' does not exist." >&2
+        exit 1
+      fi
+      loaf_validate_input_path "$token"
+
+      local normalized="${token#/}"
+      normalized="${normalized#./}"
+
+      local already_staged=""
+      for already_staged in "${staged_paths[@]}"; do
+        if [[ "$already_staged" == "$normalized" ]]; then
+          echo "[!] Error: Duplicate archive entry '$normalized' from multiple inputs (from '$token')." >&2
+          exit 1
+        fi
+      done
+      staged_paths+=("$normalized")
+
+      [[ "$VERBOSE" == true ]] && echo "[i] Staging input path: $token" >&2
+      # Stage via a tar-to-tar pipe rather than 'cp', so permissions, symlinks
+      # (kept as symlinks, not dereferenced) and directory structure are all
+      # preserved exactly the way a direct 'tar -cpf' of the input would.
+      if ! { tar --numeric-owner -cpf - -- "$token" | tar -xpf - -C "$staging"; } 2>/dev/null; then
+        echo "[!] Error: Failed to stage input path '$token'." >&2
+        exit 1
+      fi
+    fi
+  done
+
+  loaf_archive_to_hex_file "$hex_file" -C "$staging" -- "${staged_paths[@]}" || exit 1
 
   # 3. Generate Header and Output
   loaf_write_output "$hex_file" "$output"
@@ -587,7 +660,7 @@ loaf_extract() {
     local error_msg="[✗] Error during extraction pipeline (exit status: $pipeline_exit_status)."
     local is_error=false
     # Add more specific checks based on common exit codes
-    if [[ "$pipeline_exit_status" -eq 1 && "$stdout_mode" != "delimited" ]]; then is_error=true; error_msg+=" Possible xxd/gzip/tar format error or permissions issue."; fi
+    if [[ "$pipeline_exit_status" -eq 1 ]]; then is_error=true; error_msg+=" Possible xxd/gzip/tar format error or permissions issue."; fi
     if [[ "$pipeline_exit_status" -eq 2 && "$output_to_stdout" == false ]]; then is_error=true; error_msg+=" Possible tar error (e.g., file exists, permissions)."; fi
     if [[ "$pipeline_exit_status" -eq 2 && "$stdout_mode" == "delimited" ]]; then is_error=true; error_msg+=" Possible tar error reading temp stream or extracting file."; fi # Tar exit code 2 common for fatal errors
     if [[ "$pipeline_exit_status" -gt 128 && "$output_to_stdout" == false ]]; then is_error=true; error_msg+=" Command might have been terminated by a signal."; fi
@@ -618,15 +691,25 @@ print_usage() {
   # Using cat with heredoc for cleaner multiline echo
   cat << EOF
 Usage:
-  $0 [-v] c|create|make|new [<input>] [<output>] - Make a new LoaF archive
+  $0 [-v] c|cf|create|make|new <output> [<input> ...] - Make a new LoaF archive
   $0 [-v] verify <input.loaf> - Verify a LoaF archive
   $0 [-v] x|extract <input.loaf> [<target>] - Extract contents of a LoaF archive
 
-Make Options:
-  <input>: File/folder path, or '-' for stdin, or '-name.txt' for named stdin.
-           If omitted and stdin is piped, reads stdin (named '-').
-           If omitted and stdin is terminal, reads interactively (End with Ctrl+D).
+  -v / --verbose can appear anywhere on the command line (before or after
+  the subcommand and its arguments) and is always recognized as a flag,
+  never mistaken for a positional argument.
+
+Make Options (tar-style: output comes right after the command, inputs are
+last and variadic, just like 'tar cf output.tar file1 file2 ...'):
   <output>: Output file path. If omitted or '-', writes to stdout.
+  <input>: Zero or more file/folder paths, and/or at most one stdin
+           reference ('-' for stdin named '-', or '-name.txt' for stdin
+           named 'name.txt'). Multiple real paths are all archived together
+           into one loaf. If no <input> is given at all: reads stdin if
+           piped/redirected, or reads interactively if stdin is a terminal
+           (End with Ctrl+D), archived under the name '-'.
+  The output path is checked against every input path up front; loaf refuses
+  to run if writing <output> would overwrite one of the inputs.
 
 Extract Options:
   <target>: Optional target. Defaults to current directory ('.').
@@ -638,11 +721,13 @@ Extract Options:
               (e.g., --"foo bar", --'foo bar', --\$foo).
 
 Examples:
-  cat file.txt | $0 make - out.loaf   # Stdin (root name) -> out.loaf
-  cat file.txt | $0 make -data.bin    # Stdin (named data.bin) -> stdout
-  $0 make my_folder my_folder.loaf    # Folder -> my_folder.loaf
-  $0 make                             # Read interactively -> stdout
-  $0 make - my_interactive.loaf       # Read interactively -> my_interactive.loaf
+  cat file.txt | $0 c out.loaf -       # Stdin (root name) -> out.loaf
+  cat file.txt | $0 c - -data.bin      # Stdin (named data.bin) -> stdout
+  $0 c my_folder.loaf my_folder        # Folder -> my_folder.loaf
+  $0 cf my_folder.loaf my_folder       # Same as above; 'cf' is an alias for 'c'
+  $0 cf all.loaf file1.txt file2.txt dir1  # Multiple inputs -> one loaf
+  $0 c out.loaf                        # Read interactively -> out.loaf
+  $0 c -                               # Read interactively -> stdout
   $0 verify my_folder.loaf
   $0 extract my_folder.loaf            # Extract to current directory
   $0 extract my_folder.loaf -          # Extract raw content to stdout
@@ -654,45 +739,57 @@ EOF
 }
 
 # --- Option Parsing ---
-OPTIND=1
-while getopts ":v" opt; do
-  case $opt in
-    v) VERBOSE=true ;;
-    \?) print_usage; exit 1 ;;
+# -v/--verbose is recognized anywhere in the argument list (before or after
+# the subcommand), not just before it. getopts stops scanning at the first
+# non-option argument, which meant a flag placed after the subcommand (e.g.
+# 'loaf.sh make in.txt -v out.loaf') used to be silently reinterpreted as a
+# positional argument instead of being treated as an option -- with the old
+# <input> <output> signature that could send the flag through as an output
+# path and clobber a file named '-v'. This filters it out unconditionally.
+_LOAF_ARGS=()
+for _loaf_arg in "$@"; do
+  case "$_loaf_arg" in
+    -v|--verbose) VERBOSE=true ;;
+    *) _LOAF_ARGS+=("$_loaf_arg") ;;
   esac
 done
-shift $((OPTIND-1))
+set -- "${_LOAF_ARGS[@]}"
+unset _LOAF_ARGS _loaf_arg
 
 # --- Main Command Dispatch ---
 COMMAND="${1:-}"
+[[ -n "$COMMAND" ]] && shift
 if [[ "$VERBOSE" == true ]]; then
   echo "[i] Command: '$COMMAND'" >&2
-  echo "[i] Arguments: $*" >&2
+  echo "[i] Remaining arguments: $*" >&2
 fi
 
-if [[ "$COMMAND" == "make" || "$COMMAND" == "c" || "$COMMAND" == "create" || "$COMMAND" == "new" || "$COMMAND" == "loaf" || "$COMMAND" == "bake" || "$COMMAND" == "knead" || "$COMMAND" == "prepare" || "$COMMAND" == "cook" || "$COMMAND" == "spawn" || "$COMMAND" == "generate" || "$COMMAND" == "mix" || "$COMMAND" == "do" || "$COMMAND" == "cause" || "$COMMAND" == "be" || "$COMMAND" == "conjure" || "$COMMAND" == "press" || "$COMMAND" == "burn" || "$COMMAND" == "stir" || "$COMMAND" == "whip" || "$COMMAND" == "fold" || "$COMMAND" == "build" || "$COMMAND" == "embue" || "$COMMAND" == "form" || "$COMMAND" == "shape" || "$COMMAND" == "roll" ]]; then
-  loaf_make "${2:-}" "${3:-}"
+if [[ "$COMMAND" == "make" || "$COMMAND" == "c" || "$COMMAND" == "cf" || "$COMMAND" == "create" || "$COMMAND" == "new" || "$COMMAND" == "loaf" || "$COMMAND" == "bake" || "$COMMAND" == "knead" || "$COMMAND" == "prepare" || "$COMMAND" == "cook" || "$COMMAND" == "spawn" || "$COMMAND" == "generate" || "$COMMAND" == "mix" || "$COMMAND" == "do" || "$COMMAND" == "cause" || "$COMMAND" == "be" || "$COMMAND" == "conjure" || "$COMMAND" == "press" || "$COMMAND" == "burn" || "$COMMAND" == "stir" || "$COMMAND" == "whip" || "$COMMAND" == "fold" || "$COMMAND" == "build" || "$COMMAND" == "embue" || "$COMMAND" == "form" || "$COMMAND" == "shape" || "$COMMAND" == "roll" ]]; then
+  # Tar-style: <output> comes right after the command, remaining args are
+  # the variadic input list (possibly empty, meaning "read stdin").
+  loaf_make "${1:-}" "${@:2}"
 elif [[ "$COMMAND" == "verify" ]]; then
-  if [[ "$#" -ne 2 ]]; then echo "[!] Error: 'verify' requires <input.loaf>" >&2; print_usage; exit 1; fi
-  loaf_verify "$2"
+  if [[ "$#" -ne 1 ]]; then echo "[!] Error: 'verify' requires <input.loaf>" >&2; print_usage; exit 1; fi
+  loaf_verify "$1"
 elif [[ "$COMMAND" == "x" || "$COMMAND" == "extract" ]]; then
-  if [[ "$#" -lt 2 || "$#" -gt 3 ]]; then
+  if [[ "$#" -lt 1 || "$#" -gt 2 ]]; then
     echo "[!] Error: 'extract' requires <input.loaf> and optionally <target>" >&2
     print_usage
     exit 1
   fi
   # Pass the potential target argument (dir, -, --DELIM)
-  loaf_extract "$2" "${3:-.}"
+  loaf_extract "$1" "${2:-.}"
 elif [[ -z "$COMMAND" ]]; then
   # Check for piped stdin OR interactive terminal
   if [[ -p /dev/stdin || ! -t 0 ]]; then
-    # Special case: No command given, but stdin is piped. Assume 'make -'.
-    [[ "$VERBOSE" == true ]] && echo "[i] No command provided, but stdin is piped. Assuming 'make -'." >&2
-    loaf_make "-" "" # input='-', output=''
+    # Special case: No command given, but stdin is piped. Assume 'c' with
+    # no output (stdout) and no explicit input (read stdin).
+    [[ "$VERBOSE" == true ]] && echo "[i] No command provided, but stdin is piped. Assuming 'c' with stdin input and stdout output." >&2
+    loaf_make ""
   elif [[ -t 0 ]]; then
-    # Special case: No command given, stdin is terminal. Assume interactive 'make'.
-    [[ "$VERBOSE" == true ]] && echo "[i] No command provided, stdin is terminal. Assuming interactive 'make'." >&2
-    loaf_make "" "" # input='', output='' -> triggers interactive mode
+    # Special case: No command given, stdin is terminal. Assume interactive 'c'.
+    [[ "$VERBOSE" == true ]] && echo "[i] No command provided, stdin is terminal. Assuming interactive 'c' with stdout output." >&2
+    loaf_make ""
   else
     # Should not happen (stdin is neither pipe/redirect nor terminal?)
     print_usage
