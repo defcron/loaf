@@ -341,7 +341,7 @@ loaf_make() {
     archive_dir=$(loaf_temp_dir "loaf-stdin") || exit 1
     archive_path="$archive_dir/$archive_name"
     archive_parent=$(dirname "$archive_path")
-    mkdir -p "$archive_parent" || { echo "[!] Error creating temporary archive path." >&2; exit 1; }
+    mkdir -p -- "$archive_parent" || { echo "[!] Error creating temporary archive path." >&2; exit 1; }
 
     if [[ -p /dev/stdin || ! -t 0 ]]; then
       [[ "$VERBOSE" == true ]] && echo "[i] No input given; reading from stdin pipe/redirect" >&2
@@ -580,7 +580,7 @@ loaf_extract() {
     if [[ -e "$output_dir" && ! -d "$output_dir" ]]; then
         echo "[!] Error: Output target '$output_dir' exists but is not a directory." >&2; exit 1;
     fi
-    mkdir -p "$output_dir" || { echo "[!] Error creating output directory '$output_dir'." >&2; exit 1; }
+    mkdir -p -- "$output_dir" || { echo "[!] Error creating output directory '$output_dir'." >&2; exit 1; }
   fi
 
   # --- Validate Header Format ---
